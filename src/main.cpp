@@ -42,11 +42,15 @@
 // ============================================================================
 
 static constexpr UINT WM_TRAYICON       = WM_USER + 1;
+static constexpr UINT WM_APP_RESCAN     = WM_USER + 2; // Triggered by device connect/disconnect
 static constexpr UINT IDM_STATUS        = 1001;
 static constexpr UINT IDM_RESTART       = 1002;
 static constexpr UINT IDM_QUIT          = 1003;
+
 static constexpr UINT TIMER_HEALTHCHECK = 1;
+static constexpr UINT TIMER_RESCAN      = 2;
 static constexpr UINT HEALTHCHECK_MS    = 5000;
+static constexpr UINT RESCAN_DELAY_MS   = 1000; // Debounce delay for USB unplugs
 
 static constexpr int  SILENCE_SAMPLERATE  = 48000;
 static constexpr int  SILENCE_CHANNELS    = 2;
@@ -82,6 +86,58 @@ public:
     T** GetAddressOf()     { return &ptr_; }
     T*  operator->() const { return ptr_; }
     explicit operator bool() const { return ptr_ != nullptr; }
+};
+
+// ============================================================================
+// Device Notification Callback (Auto-rescan on USB plug/unplug)
+// ============================================================================
+
+class DeviceNotificationClient : public IMMNotificationClient {
+    LONG m_refCount = 1;
+    HWND m_hwnd;
+public:
+    DeviceNotificationClient(HWND hwnd) : m_hwnd(hwnd) {}
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return InterlockedIncrement(&m_refCount);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG ulRef = InterlockedDecrement(&m_refCount);
+        if (0 == ulRef) delete this;
+        return ulRef;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, VOID **ppvInterface) override {
+        if (IID_IUnknown == riid || __uuidof(IMMNotificationClient) == riid) {
+            *ppvInterface = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppvInterface = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    // Callbacks run on a worker thread. We PostMessage back to our main UI thread
+    // to safely do COM teardowns/rebuilds without violating apartment rules.
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override {
+        PostMessageW(m_hwnd, WM_APP_RESCAN, 0, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override {
+        PostMessageW(m_hwnd, WM_APP_RESCAN, 0, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override {
+        PostMessageW(m_hwnd, WM_APP_RESCAN, 0, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow, ERole, LPCWSTR) override {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override {
+        return S_OK;
+    }
 };
 
 // ============================================================================
@@ -218,6 +274,9 @@ struct EndpointSession {
     }
 };
 
+// Forward declaration of icon generator
+static HICON CreateKeepAliveIcon(bool allAlive);
+
 // ============================================================================
 // Application state
 // ============================================================================
@@ -230,19 +289,39 @@ struct AppState {
     int                           totalCount = 0;
     bool                          comInitialized = false;
 
-    bool EnumerateAndStart() {
-        sessions.clear();
-        aliveCount = 0;
+    ComPtr<IMMDeviceEnumerator>   enumerator;
+    DeviceNotificationClient*     notifyClient = nullptr;
 
-        ComPtr<IMMDeviceEnumerator> enumerator;
+    bool InitAudioSystem() {
         HRESULT hr = CoCreateInstance(
             __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
             __uuidof(IMMDeviceEnumerator),
             reinterpret_cast<void**>(enumerator.GetAddressOf()));
         if (FAILED(hr)) return false;
 
+        notifyClient = new DeviceNotificationClient(hwnd);
+        enumerator->RegisterEndpointNotificationCallback(notifyClient);
+        return true;
+    }
+
+    void CleanupAudioSystem() {
+        if (enumerator && notifyClient) {
+            enumerator->UnregisterEndpointNotificationCallback(notifyClient);
+            notifyClient->Release();
+            notifyClient = nullptr;
+        }
+        enumerator.Release();
+    }
+
+    bool EnumerateAndStart() {
+        sessions.clear();
+        aliveCount = 0;
+        totalCount = 0;
+
+        if (!enumerator) return false;
+
         ComPtr<IMMDeviceCollection> collection;
-        hr = enumerator->EnumAudioEndpoints(
+        HRESULT hr = enumerator->EnumAudioEndpoints(
             eRender, DEVICE_STATE_ACTIVE,
             collection.GetAddressOf());
         if (FAILED(hr)) return false;
@@ -304,13 +383,18 @@ struct AppState {
     }
 
     void RunHealthChecks() {
+        int oldAliveCount = aliveCount;
         aliveCount = 0;
         for (auto& s : sessions) {
             if (s.HealthCheck()) {
                 aliveCount++;
             }
         }
-        UpdateTrayTooltip();
+        
+        // Update tray if status changed (or just to keep tooltip fresh)
+        if (oldAliveCount != aliveCount) {
+            UpdateTrayIconAndTooltip();
+        }
     }
 
     void StopAll() {
@@ -320,12 +404,25 @@ struct AppState {
         aliveCount = 0;
     }
 
-    void UpdateTrayTooltip() {
+    void UpdateTrayIconAndTooltip() {
+        bool allAlive = (totalCount > 0 && aliveCount == totalCount);
+
+        // Regenerate and replace icon to reflect current status (Green/Red)
+        HICON hNewIcon = CreateKeepAliveIcon(allAlive);
+        if (nid.hIcon) { DestroyIcon(nid.hIcon); }
+        nid.hIcon = hNewIcon;
+
+        // Update tooltip text
         wchar_t tip[128];
-        _snwprintf_s(tip, _countof(tip), _TRUNCATE,
-            L"GoXLR Keep-Alive: %d/%d endpoints alive",
-            aliveCount, totalCount);
+        if (totalCount > 0) {
+            _snwprintf_s(tip, _countof(tip), _TRUNCATE,
+                L"GoXLR Keep-Alive: %d/%d endpoints alive",
+                aliveCount, totalCount);
+        } else {
+            wcscpy_s(tip, L"GoXLR Keep-Alive: no endpoints found");
+        }
         wcscpy_s(nid.szTip, tip);
+
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 
@@ -355,8 +452,7 @@ struct AppState {
 static AppState g_app;
 
 // ============================================================================
-// Systray icon resource (embedded XPM-style — a tiny green circle)
-// We generate a simple icon programmatically since we have no .ico resource
+// Systray icon resource (embedded XPM-style — a tiny green/red circle)
 // ============================================================================
 
 static HICON CreateKeepAliveIcon(bool allAlive) {
@@ -430,9 +526,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SetTimer(hwnd, TIMER_HEALTHCHECK, HEALTHCHECK_MS, nullptr);
         return 0;
 
+    case WM_APP_RESCAN:
+        // Debounce timer: USB replugging fires many events. We wait 1 sec to let it settle.
+        SetTimer(hwnd, TIMER_RESCAN, RESCAN_DELAY_MS, nullptr);
+        return 0;
+
     case WM_TIMER:
         if (wParam == TIMER_HEALTHCHECK) {
             g_app.RunHealthChecks();
+        }
+        else if (wParam == TIMER_RESCAN) {
+            KillTimer(hwnd, TIMER_RESCAN);
+            g_app.StopAll();
+            g_app.EnumerateAndStart();
+            g_app.UpdateTrayIconAndTooltip();
         }
         return 0;
 
@@ -470,7 +577,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_RESTART:
             g_app.StopAll();
             g_app.EnumerateAndStart();
-            g_app.UpdateTrayTooltip();
+            g_app.UpdateTrayIconAndTooltip();
             break;
         case IDM_QUIT:
             PostQuitMessage(0);
@@ -480,6 +587,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_HEALTHCHECK);
+        KillTimer(hwnd, TIMER_RESCAN);
         Shell_NotifyIconW(NIM_DELETE, &g_app.nid);
         if (g_app.nid.hIcon) DestroyIcon(g_app.nid.hIcon);
         PostQuitMessage(0);
@@ -522,28 +630,34 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
+    // Init IMMDeviceEnumerator and register plug/unplug callbacks
+    if (!g_app.InitAudioSystem()) {
+        MessageBoxW(nullptr, L"Failed to initialize Audio System.", APP_NAME, MB_ICONERROR);
+        CoUninitialize();
+        return 1;
+    }
+
     // Enumerate GoXLR endpoints and start sessions
-    bool found = g_app.EnumerateAndStart();
+    g_app.EnumerateAndStart();
 
-    // Setup systray icon
-    HICON hIcon = CreateKeepAliveIcon(found && g_app.aliveCount == g_app.totalCount);
-
+    // Setup initial systray base data
     g_app.nid.cbSize           = sizeof(g_app.nid);
     g_app.nid.hWnd             = g_app.hwnd;
     g_app.nid.uID              = 1;
     g_app.nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_app.nid.uCallbackMessage = WM_TRAYICON;
-    g_app.nid.hIcon            = hIcon;
+    
+    // Create initial icon to satisfy NIM_ADD
+    bool allAlive = (g_app.totalCount > 0 && g_app.aliveCount == g_app.totalCount);
+    g_app.nid.hIcon = CreateKeepAliveIcon(allAlive);
 
-    wchar_t tip[128];
-    if (found) {
-        _snwprintf_s(tip, _countof(tip), _TRUNCATE,
+    if (g_app.totalCount > 0) {
+        _snwprintf_s(g_app.nid.szTip, _countof(g_app.nid.szTip), _TRUNCATE,
             L"GoXLR Keep-Alive: %d/%d endpoints alive",
             g_app.aliveCount, g_app.totalCount);
     } else {
-        wcscpy_s(tip, L"GoXLR Keep-Alive: no endpoints found");
+        wcscpy_s(g_app.nid.szTip, L"GoXLR Keep-Alive: no endpoints found");
     }
-    wcscpy_s(g_app.nid.szTip, tip);
 
     Shell_NotifyIconW(NIM_ADD, &g_app.nid);
 
@@ -556,6 +670,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     // Cleanup
     g_app.StopAll();
+    g_app.CleanupAudioSystem();
     CoUninitialize();
     return 0;
 }

@@ -10,7 +10,6 @@
 // Build: cl /EHsc /O2 /DUNICODE /D_UNICODE main.cpp /link ole32.lib shell32.lib user32.lib
 //    or: use the provided build.bat / CMakeLists.txt
 //
-// Author: Claude × Colin — "50 KB tout mouillé" (narrator: it was not 50 KB)
 // License: MIT
 // ============================================================================
 

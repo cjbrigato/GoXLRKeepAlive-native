@@ -580,7 +580,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.UpdateTrayIconAndTooltip();
             break;
         case IDM_QUIT:
-            PostQuitMessage(0);
+            DestroyWindow(hwnd);
             break;
         }
         return 0;
@@ -670,6 +670,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     // Cleanup
     g_app.StopAll();
+    g_app.sessions.clear();
     g_app.CleanupAudioSystem();
     CoUninitialize();
     return 0;
